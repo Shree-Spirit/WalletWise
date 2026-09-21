@@ -1,4 +1,4 @@
-﻿const mongoose = require('mongoose');
+const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 
@@ -213,7 +213,7 @@ const userSchema = new mongoose.Schema({
     type: Date,
     default: Date.now
   }
-});
+}, { optimisticConcurrency: true });
 
 userSchema.index({ studentId: 1 }, { unique: true });
 

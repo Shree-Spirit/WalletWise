@@ -47,7 +47,7 @@ const walletSchema = new mongoose.Schema({
       default: Date.now
     }
   }],
-}, { timestamps: true });
+}, { timestamps: true, optimisticConcurrency: true });
 
 // Ensure owner is always an admin member
 walletSchema.pre('save', function (next) {
