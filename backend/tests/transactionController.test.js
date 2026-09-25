@@ -178,6 +178,27 @@ describe('Transaction Controller', () => {
         });
     });
 
+    describe('Optimistic Concurrency Control (OCC)', () => {
+        it('should handle concurrent addTransaction requests without losing balance updates', async () => {
+            const reqs = [1, 2, 3].map(i => mockRequest({
+                type: 'expense',
+                amount: 100,
+                category: 'shopping',
+                description: `concurrent ${i}`
+            }, {}, {}, user._id));
+
+            const responses = reqs.map(() => mockResponse());
+
+            await Promise.all(reqs.map((req, i) => addTransaction(req, responses[i])));
+
+            const updatedUser = await User.findById(user._id);
+            expect(updatedUser.walletBalance).toBe(700); // 1000 - (100 * 3)
+            
+            const txCount = await Transaction.countDocuments({ userId: user._id, category: 'shopping' });
+            expect(txCount).toBe(3);
+        });
+    });
+
     describe('updateTransaction', () => {
         let transaction;
 

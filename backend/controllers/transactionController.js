@@ -124,6 +124,41 @@ const addTransaction = catchAsync(async (req, res, next) => {
       nextExecutionDate = now;
     }
 
+    const balanceChange = type === 'income' ? amount : -amount;
+
+    if (walletId) {
+      // Conditional atomic update
+      const query = { _id: walletId };
+      if (STRICT_MODE && balanceChange < 0) {
+        query.balance = { $gte: Math.abs(balanceChange) };
+      }
+      
+      const updatedWallet = await require('../models/Wallet').findOneAndUpdate(
+        query,
+        { $inc: { balance: balanceChange } },
+        { session, new: true }
+      );
+
+      if (!updatedWallet) {
+        throw new AppError('Insufficient funds in shared wallet or wallet not found', 400);
+      }
+    } else {
+      const query = { _id: userId };
+      if (STRICT_MODE && balanceChange < 0) {
+        query.walletBalance = { $gte: Math.abs(balanceChange) };
+      }
+
+      const updatedUser = await User.findOneAndUpdate(
+        query,
+        { $inc: { walletBalance: balanceChange } },
+        { session, new: true }
+      );
+
+      if (!updatedUser) {
+        throw new AppError('Insufficient personal funds or user not found', 400);
+      }
+    }
+
     const transaction = new Transaction({
       userId,
       type,
@@ -142,25 +177,6 @@ const addTransaction = catchAsync(async (req, res, next) => {
       encryptedData
     });
 
-    await transaction.save({ session });
-
-    // Update balance
-    const balanceChange = type === 'income' ? amount : -amount;
-
-    if (walletId) {
-      // Update shared wallet balance
-      await Wallet.findByIdAndUpdate(
-        walletId,
-        { $inc: { balance: balanceChange } },
-        { session }
-      );
-    } else {
-      // Update personal balance
-      await User.findByIdAndUpdate(
-        userId,
-        { $inc: { walletBalance: balanceChange } },
-        { session }
-      );
     }
 
     // Log Activity
@@ -230,6 +246,24 @@ const getAllTransactions = catchAsync(async (req, res) => {
   for (const rt of recurringTransactions) {
     await withTransaction(async (session) => {
 
+      const balanceChange = rt.type === 'income' ? rt.amount : -rt.amount;
+      
+      const query = { _id: rt.userId };
+      if (STRICT_MODE && balanceChange < 0) {
+        query.walletBalance = { $gte: Math.abs(balanceChange) };
+      }
+
+      const updatedUser = await User.findOneAndUpdate(
+        query,
+        { $inc: { walletBalance: balanceChange } },
+        { session, new: true }
+      );
+
+      if (!updatedUser) {
+        // Skip this recurrence due to insufficient funds
+        throw new AppError('Insufficient personal funds to process recurring transaction', 400);
+      }
+
       const newTransaction = new Transaction({
         userId: rt.userId,
         type: rt.type,
@@ -241,15 +275,13 @@ const getAllTransactions = catchAsync(async (req, res) => {
         date: new Date()
       });
 
-      await newTransaction.save({ session });
-
-      const balanceChange = rt.type === 'income' ? rt.amount : -rt.amount;
-
-      await User.findByIdAndUpdate(
-        rt.userId,
-        { $inc: { walletBalance: balanceChange } },
-        { session }
-      );
+      try {
+        await newTransaction.save({ session });
+      } catch (error) {
+        // Revert balance change
+        await User.findByIdAndUpdate(rt.userId, { $inc: { walletBalance: -balanceChange } }, { session });
+        throw error;
+      }
 
       await logTransactionActivity({
         userId: rt.userId,
@@ -281,7 +313,10 @@ const getAllTransactions = catchAsync(async (req, res) => {
   }
 
   if (search) {
-    const regex = new RegExp(search, 'i');
+    // Escape regex metacharacters so user input is treated as a literal
+    // substring, preventing regex-injection and ReDoS via crafted patterns.
+    const escaped = String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(escaped, 'i');
     query.$or = [{ description: regex }, { category: regex }];
   }
 
@@ -362,7 +397,7 @@ const deleteTransaction = catchAsync(async (req, res) => {
     throw new AppError('Invalid transaction ID format', 400);
   }
 
-  const transaction = await Transaction.findOneAndDelete({ _id: id, userId });
+  const transaction = await Transaction.findOne({ _id: id, userId });
 
   if (!transaction) {
     throw new AppError('Transaction not found', 404);
@@ -374,13 +409,34 @@ const deleteTransaction = catchAsync(async (req, res) => {
       : transaction.amount;
 
   if (transaction.walletId) {
-    await Wallet.findByIdAndUpdate(transaction.walletId, {
       $inc: { balance: balanceChange }
     });
+    if (!updatedWallet) {
+      throw new AppError('Cannot delete income transaction: Insufficient funds in shared wallet to cover deduction', 400);
+    }
   } else {
-    await User.findByIdAndUpdate(userId, {
+    const query = { _id: userId };
+    if (STRICT_MODE && balanceChange < 0) {
+      query.walletBalance = { $gte: Math.abs(balanceChange) };
+    }
+    const updatedUser = await User.findOneAndUpdate(query, {
       $inc: { walletBalance: balanceChange }
     });
+    if (!updatedUser) {
+      throw new AppError('Cannot delete income transaction: Insufficient personal funds to cover deduction', 400);
+    }
+  }
+
+  try {
+    await Transaction.findByIdAndDelete(id);
+  } catch(e) {
+    // revert
+    if (transaction.walletId) {
+      await require('../models/Wallet').findByIdAndUpdate(transaction.walletId, { $inc: { balance: -balanceChange } });
+    } else {
+      await User.findByIdAndUpdate(userId, { $inc: { walletBalance: -balanceChange } });
+    }
+    throw e;
   }
 
   await logTransactionActivity({
@@ -439,6 +495,24 @@ const undoTransaction = catchAsync(async (req, res) => {
     throw new AppError('No transaction data provided for undo', 400);
   }
 
+  const balanceChange =
+    deletedTransaction.type === 'income'
+      ? deletedTransaction.amount
+      : -deletedTransaction.amount;
+
+  const query = { _id: userId };
+  if (STRICT_MODE && balanceChange < 0) {
+    query.walletBalance = { $gte: Math.abs(balanceChange) };
+  }
+
+  const updatedUser = await User.findOneAndUpdate(query, {
+    $inc: { walletBalance: balanceChange }
+  });
+
+  if (!updatedUser) {
+    throw new AppError('Cannot undo expense: Insufficient personal funds', 400);
+  }
+
   const restored = new Transaction({
     userId,
     type: deletedTransaction.type,
@@ -450,16 +524,12 @@ const undoTransaction = catchAsync(async (req, res) => {
     date: deletedTransaction.date || new Date()
   });
 
-  await restored.save();
-
-  const balanceChange =
-    restored.type === 'income'
-      ? restored.amount
-      : -restored.amount;
-
-  await User.findByIdAndUpdate(userId, {
-    $inc: { walletBalance: balanceChange }
-  });
+  try {
+    await restored.save();
+  } catch(e) {
+    await User.findByIdAndUpdate(userId, { $inc: { walletBalance: -balanceChange } });
+    throw e;
+  }
 
   await logTransactionActivity({
     userId,
