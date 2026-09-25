@@ -260,7 +260,10 @@ const getAllTransactions = catchAsync(async (req, res) => {
   }
 
   if (search) {
-    const regex = new RegExp(search, 'i');
+    // Escape regex metacharacters so user input is treated as a literal
+    // substring, preventing regex-injection and ReDoS via crafted patterns.
+    const escaped = String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(escaped, 'i');
     query.$or = [{ description: regex }, { category: regex }];
   }
 
